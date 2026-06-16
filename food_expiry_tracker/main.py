@@ -112,8 +112,9 @@ def _build_items_tab(notebook: ttk.Notebook, conn):
 
     # MAIN LIST WITH COLOR CODE (Treeview pattern)
     # columns: checkbox state | food name | quantity | expiry date | days left | edit action
-    # "check" column holds a ☐/☑ character (toggled when logic is wired up).
-    # "action" column holds "✏ Edit" text representing the per-row EDIT ITEM button.
+    # "check" column holds a ☐/☑ character, toggled by clicking it (see _on_tree_click).
+    # "action" column holds "Edit" text representing the per-row EDIT ITEM button,
+    # also handled in _on_tree_click.
     columns = ("check", "name", "qty", "expiry", "days", "action")
     tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=8)
 
@@ -163,11 +164,14 @@ def _build_items_tab(notebook: ttk.Notebook, conn):
     btn_frame.pack(fill="x", pady=(0, 6))
 
     # REMOVE SELECTED button
-    tk.Button(
+    # kept as a variable so its command can be attached further down,
+    # once _on_remove_selected (which needs refresh_listbox) has been defined
+    remove_button = tk.Button(
         btn_frame, text="REMOVE SELECTED",
         bg="#3420e5", fg="black", activebackground="#2816ca",
         padx=10, pady=4,
-    ).pack(side="left", padx=(0, 8))
+    )
+    remove_button.pack(side="left", padx=(0, 8))
 
     # Blue GET RECIPES button
     tk.Button(
@@ -187,6 +191,9 @@ def _build_items_tab(notebook: ttk.Notebook, conn):
     warning_label.pack(fill="x")
 
     _sort_key = ["days"]
+
+    checked_items = set()
+    editing_item_id = [None]
 
     def _days_label(days: int):
         if days < 0:
@@ -220,14 +227,18 @@ def _build_items_tab(notebook: ttk.Notebook, conn):
 
     def _populate_tree(items: list):
         # wipe every existing row before re-inserting; this is the full-refresh pattern
-        # that avoids stale duplicates when the DB changes
+        # that avoids duplicates when the DB changes
         for row_id in tree.get_children():
             tree.delete(row_id)
 
         for item in items:
-            tree.insert("", "end",
+            # use the food_items row id as the Treeview row's iid so a click on a
+            row_iid = str(item.item_id)
+            check_symbol = "☑" if row_iid in checked_items else "☐"
+
+            tree.insert("", "end", iid=row_iid,
                         values=(
-                            "☐",
+                            check_symbol,
                             item.name,
                             item.quantity,
                             item.expiry_date_str(),
@@ -259,7 +270,12 @@ def _build_items_tab(notebook: ttk.Notebook, conn):
         _sort_key[0] = key
         refresh_listbox()
 
-    def _on_add() -> None:
+    def _validate_inputs():
+        # reads and validates the three entry fields, shared by both the
+        # "add new item" and "save edited item" flows.
+        # returns (name, quantity, expiry_date) on success, or None on failure
+        # (an error messagebox has already been shown in the failure case).
+
         # read raw text from every entry field
         raw_name   = name_entry.get()
         raw_qty    = qty_entry.get()
@@ -272,7 +288,7 @@ def _build_items_tab(notebook: ttk.Notebook, conn):
         # validate_date checks the name isn't blank AND the date parses correctly;
         # it shows its own messagebox.showerror on failure
         if not validate_date(expiry_val, name_val):
-            return
+            return None
 
         # show an error if it isn't a plain integer
         qty_raw = raw_qty if raw_qty != "e.g. 3" else ""
@@ -280,27 +296,127 @@ def _build_items_tab(notebook: ttk.Notebook, conn):
             qty_val = int(qty_raw)
         except ValueError:
             messagebox.showerror("Input Error", "Quantity must be a whole number.")
-            return
+            return None
 
-        # all inputs are valid 
-        item = FoodItem(item_id=None, name=name_val, quantity=qty_val, expiry_date=expiry_val)
-        db.insert_item(conn, item)
+        # all inputs are valid
+        return name_val, qty_val, expiry_val
 
+    def _reset_form():
+        # clears the entry fields back to their placeholder text...
         _restore_placeholder(name_entry,   "e.g. Apple")
         _restore_placeholder(qty_entry,    "e.g. 3")
         _restore_placeholder(expiry_entry, "DD/MM/YYYY")
 
+        # ...and switches the form back to "add a new item" mode
+        editing_item_id[0] = None
+        save_button.config(text="+ ADD ITEM")
+
+    def _on_save():
+        # called by the form's main button, in either "+ ADD ITEM" or
+        # "Save Changes" mode depending on editing_item_id
+        result = _validate_inputs()
+        if result is None:
+            return
+        name_val, qty_val, expiry_val = result
+
+        if editing_item_id[0] is None:
+            # ADD MODE: no existing row is selected, so insert a brand new item
+            item = FoodItem(item_id=None, name=name_val, quantity=qty_val, expiry_date=expiry_val)
+            db.insert_item(conn, item)
+        else:
+            # EDIT MODE: overwrite the row that was loaded by _start_edit
+            db.update_item(conn, editing_item_id[0], name_val, qty_val, expiry_val)
+
+        _reset_form()
+        refresh_listbox()
+
+    def _start_edit(row_id: str):
+        # called when the "Edit" cell in a row is clicked; copies that row's
+        # current values into the form and switches it into "Save Changes" mode
+        values = tree.item(row_id, "values")
+        name_val, qty_val, expiry_val = values[1], values[2], values[3]
+
+        # drop the row's current values into the entries, overwriting
+        # whatever placeholder/previous text was there
+        name_entry.delete(0, tk.END)
+        name_entry.insert(0, name_val)
+        name_entry.config(fg="black")
+
+        qty_entry.delete(0, tk.END)
+        qty_entry.insert(0, str(qty_val))
+        qty_entry.config(fg="black")
+
+        expiry_entry.delete(0, tk.END)
+        expiry_entry.insert(0, expiry_val)
+        expiry_entry.config(fg="black")
+
+        # remember which db row the form now represents, and relabel the
+        # button so the user knows the next click will save, not add
+        editing_item_id[0] = int(row_id)
+        save_button.config(text="Save Changes")
+
+    def _on_tree_click(event):
+        # handles clicks on the Treeview: toggles the checkbox column and
+        # triggers edit mode when the "Edit" action column is clicked
+        if tree.identify_region(event.x, event.y) != "cell":
+            return  # ignore clicks on headings/empty space
+
+        row_id = tree.identify_row(event.y)
+        column = tree.identify_column(event.x)
+        if not row_id:
+            return
+
+        if column == "#1":
+            # "check" column: flip this row's ticked/unticked state
+            if row_id in checked_items:
+                checked_items.discard(row_id)
+                new_symbol = "☐"
+            else:
+                checked_items.add(row_id)
+                new_symbol = "☑"
+
+            row_values = list(tree.item(row_id, "values"))
+            row_values[0] = new_symbol
+            tree.item(row_id, values=row_values)
+
+        elif column == "#6":
+            # "action" column: load this row into the form for editing
+            _start_edit(row_id)
+
+    def _on_remove_selected():
+        # deletes every row whose checkbox is ticked
+        if not checked_items:
+            messagebox.showerror(
+                "Selection Error",
+                "No items selected. Tick the checkbox next to the item(s) you want to remove."
+            )
+            return
+
+        for item_id in checked_items:
+            db.delete_item(conn, int(item_id))
+
+        checked_items.clear()
         refresh_listbox()
 
 
-    # ADD ITEM button (Button bg pattern)
-    tk.Button(
+    # ADD ITEM / SAVE CHANGES button (Button bg pattern)
+    # this single button is reused for both modes; _on_save checks
+    # editing_item_id to decide whether to insert or update, and
+    # _reset_form()/_start_edit() flip its text between the two labels
+    save_button = tk.Button(
         add_section, text="+ ADD ITEM",
         bg="#E877B5", fg="black", activebackground="#155b19",
         padx=10, pady=4,
-        command=_on_add,
-    ).grid(row=3, column=1, sticky="e", pady=(8, 0))
+        command=_on_save,
+    )
+    save_button.grid(row=3, column=1, sticky="e", pady=(8, 0))
 
+    # now that _on_remove_selected exists, attach it to the button
+    # created earlier alongside btn_frame
+    remove_button.config(command=_on_remove_selected)
+
+    # clicking the checkbox or "Edit" cell of any row is routed through _on_tree_click
+    tree.bind("<Button-1>", _on_tree_click)
 
     for _sort_label, _key in (
         ("Name",        "name"),

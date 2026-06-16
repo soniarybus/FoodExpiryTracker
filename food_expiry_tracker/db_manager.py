@@ -1,11 +1,14 @@
+import os
 import sqlite3
 import json
 from models import FoodItem, Recipe
 
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "food_tracker.db")
+
 
 def create_connection():
     # Opens food_tracker.db if it exists, or creates it if it doesn't
-    conn = sqlite3.connect("food_tracker.db")
+    conn = sqlite3.connect(DB_PATH)
     return conn
 
 
@@ -61,6 +64,17 @@ def delete_item(conn, item_id):
     # Deletes the food_items row matching the given primary key id
     cursor = conn.cursor()
     cursor.execute("DELETE FROM food_items WHERE id = ?", (item_id,))
+    conn.commit()
+
+
+def update_item(conn, item_id, name, quantity, expiry_date):
+    # Overwrites name, quantity and expiry_date for the food_items row matching item_id
+    # expiry_date is expected as DD/MM/YYYY text, same format used when inserting
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE food_items SET name = ?, quantity = ?, expiry_date = ? WHERE id = ?",  # prevents SQL injection
+        (name, quantity, expiry_date, item_id)
+    )
     conn.commit()
 
 
