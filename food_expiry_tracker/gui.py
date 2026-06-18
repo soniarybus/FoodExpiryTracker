@@ -208,9 +208,9 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
     )
     warning_label.pack(fill="x")
 
-    _sort_key = ["days"]
+    _sort_key = "days"
     checked_items = set()
-    editing_item_id = [None]
+    editing_item_id = None
 
     def _days_label(days: int):
         if days < 0:
@@ -268,7 +268,7 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
 
     def refresh_listbox():
         items = db.fetch_all_items(conn)
-        key = _sort_key[0]
+        key = _sort_key
         if key == "days":
             items.sort(key=lambda it: (it.days_remaining(), it.name.lower()))
         elif key == "name":
@@ -278,7 +278,8 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
         _populate_tree(items)
 
     def _sort_by(key: str):
-        _sort_key[0] = key
+        nonlocal _sort_key
+        _sort_key = key
         refresh_listbox()
 
     def _validate_inputs():
@@ -301,9 +302,13 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
         except ValueError:
             messagebox.showerror("Input Error", "Quantity must be a whole number.")
             return None
+        if qty_val <= 0:
+            messagebox.showerror("Input Error", "Quantity must be a positive whole number.")
+            return None
         return name_val, qty_val, expiry_val
 
     def _reset_form():
+        nonlocal editing_item_id
         # clears the entry fields back to their placeholder text
         _restore_placeholder(name_entry, "e.g. Apple")
         _restore_placeholder(qty_entry,  "e.g. 3")
@@ -313,7 +318,7 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
         _cal.selection_set(_now)
 
         # and switches the form back to "add a new item" mode
-        editing_item_id[0] = None
+        editing_item_id = None
         save_button.config(text="+ ADD ITEM")
 
     def _on_save():
@@ -322,18 +327,19 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
             return
         name_val, qty_val, expiry_val = result
 
-        if editing_item_id[0] is None:
+        if editing_item_id is None:
             # ADD MODE: no existing row is selected, so insert a brand new item
             item = FoodItem(item_id=None, name=name_val, quantity=qty_val, expiry_date=expiry_val)
             db.insert_item(conn, item)
         else:
             # EDIT MODE: overwrite the row that was loaded by _start_edit
-            db.update_item(conn, editing_item_id[0], name_val, qty_val, expiry_val)
+            db.update_item(conn, editing_item_id, name_val, qty_val, expiry_val)
 
         _reset_form()
         refresh_listbox()
 
     def _start_edit(row_id: str):
+        nonlocal editing_item_id
         values = tree.item(row_id, "values")
         name_val, qty_val, expiry_val = values[1], values[2], values[3]
 

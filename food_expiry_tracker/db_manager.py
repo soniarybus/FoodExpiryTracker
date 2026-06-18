@@ -52,7 +52,7 @@ def fetch_all_items(conn):
     cursor.execute("SELECT id, name, quantity, expiry_date FROM food_items")
     rows = cursor.fetchall()
     return [FoodItem(item_id=row[0], name=row[1], quantity=row[2], expiry_date=row[3]) for row in rows]
-
+#doesnt return raw tuples but puts them back into FoodItem
 
 def delete_item(conn, item_id):
     cursor = conn.cursor()
@@ -77,7 +77,7 @@ def insert_recipe(conn, recipe):
     )
     conn.commit()
     return cursor.lastrowid
-
+#json turns it into a string like thing for SQL-lite
 
 def fetch_saved_recipes(conn):
     cursor = conn.cursor()

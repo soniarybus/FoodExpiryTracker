@@ -9,7 +9,7 @@ class FoodItem:
         self.expiry_date: date = datetime.strptime(expiry_date, "%d/%m/%Y").date()
 
     def days_remaining(self):
-        return (self.expiry_date - date.today()).days #maybe delete?
+        return (self.expiry_date - date.today()).days
 
     def colour_tag(self):
         days = self.days_remaining()
