@@ -6,7 +6,6 @@ class FoodItem:
         self.item_id = item_id
         self.name = name
         self.quantity = quantity
-        # Parse DD/MM/YYYY string into a date object at construction time
         self.expiry_date: date = datetime.strptime(expiry_date, "%d/%m/%Y").date()
 
     def days_remaining(self):
@@ -27,19 +26,17 @@ class FoodItem:
 
 class Recipe:
 
-    def __init__(self, title: str, ingredients: list[str], match_count: int = 0, is_cached: bool = False):
-        #the match and is cached have default values
+    def __init__(self, title: str, ingredients: list[str], match_count: int = 0, is_cached: bool = False, id: int = None):
+        self.id = id
         self.title = title
         self.ingredients = ingredients
-        # Number of food items the user selected when manually triggering this recipe
+        # number of food items chosen to load recipe
         self.match_count = match_count
-        # True when this recipe was loaded from a local cache rather than fetched fresh
+        # true when this recipe was loaded from a local cache 
         self.is_cached = is_cached
 
     def match_score(self, items: list[FoodItem]):
-        #counts how many of the user's current FoodItem names appear in this recipe's ingredients (case-insensitive).
         item_names = {item.name.lower() for item in items}
-        # Ingredient text may contain the item name as a substring, so use 'in' rather than exact match
         return sum(
             1 for ingredient in self.ingredients
             if any(name in ingredient.lower() for name in item_names)
