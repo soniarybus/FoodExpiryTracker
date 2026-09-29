@@ -1,0 +1,1286 @@
+diff --git a/.DS_Store b/.DS_Store
+index 1b0adb0..8213271 100644
+Binary files a/.DS_Store and b/.DS_Store differ
+diff --git a/food_expiry_tracker/__pycache__/api.cpython-314.pyc b/food_expiry_tracker/__pycache__/api.cpython-314.pyc
+index 12a2732..cbafc36 100644
+Binary files a/food_expiry_tracker/__pycache__/api.cpython-314.pyc and b/food_expiry_tracker/__pycache__/api.cpython-314.pyc differ
+diff --git a/food_expiry_tracker/__pycache__/db_manager.cpython-314.pyc b/food_expiry_tracker/__pycache__/db_manager.cpython-314.pyc
+index acfc953..a168a07 100644
+Binary files a/food_expiry_tracker/__pycache__/db_manager.cpython-314.pyc and b/food_expiry_tracker/__pycache__/db_manager.cpython-314.pyc differ
+diff --git a/food_expiry_tracker/__pycache__/gui.cpython-314.pyc b/food_expiry_tracker/__pycache__/gui.cpython-314.pyc
+index e549ae9..60fad0c 100644
+Binary files a/food_expiry_tracker/__pycache__/gui.cpython-314.pyc and b/food_expiry_tracker/__pycache__/gui.cpython-314.pyc differ
+diff --git a/food_expiry_tracker/__pycache__/main.cpython-314.pyc b/food_expiry_tracker/__pycache__/main.cpython-314.pyc
+index a1a81a5..fccbd94 100644
+Binary files a/food_expiry_tracker/__pycache__/main.cpython-314.pyc and b/food_expiry_tracker/__pycache__/main.cpython-314.pyc differ
+diff --git a/food_expiry_tracker/__pycache__/models.cpython-314.pyc b/food_expiry_tracker/__pycache__/models.cpython-314.pyc
+index 7c6bb20..f3bc0e6 100644
+Binary files a/food_expiry_tracker/__pycache__/models.cpython-314.pyc and b/food_expiry_tracker/__pycache__/models.cpython-314.pyc differ
+diff --git a/food_expiry_tracker/api.py b/food_expiry_tracker/api.py
+index 51578a2..67161ec 100644
+--- a/food_expiry_tracker/api.py
++++ b/food_expiry_tracker/api.py
+@@ -1,4 +1,8 @@
+-# Requires: pip install requests
++import re
++import threading
++import unicodedata
++from concurrent.futures import ThreadPoolExecutor
++
+ import requests
+ from models import Recipe
+ 
+@@ -18,6 +22,50 @@ class OfflineError(APIError):
+     pass
+ 
+ 
++_HTML_TAG_RE = re.compile(r"<[^>]+>")
++
++
++def clean_ingredient(text) -> str:
++    """Normalise one ingredient string for storage/display.
++
++    Round-tripping through encode(..., "backslashreplace") / decode
++    ("unicode_escape") turns literal "\\u00bc"-style text — which shows up
++    when a value has been JSON-encoded more than once, e.g. an old cache row
++    — into the real character (¼), while leaving already-correct unicode
++    text unchanged (it re-escapes and then decodes right back to itself).
++    The rest strips stray list/JSON punctuation left over from a raw
++    str(list) or partially-parsed JSON fragment.
++    """
++    if not text:
++        return ""
++    text = str(text)
++    try:
++        text = text.encode("ascii", "backslashreplace").decode("unicode_escape")
++    except (UnicodeDecodeError, UnicodeEncodeError):
++        pass
++    text = unicodedata.normalize("NFC", text)
++    text = text.strip().strip("[]").strip().strip("\"'").strip()
++    text = text.replace("\\", "").strip()
++    return text
++
++
++def is_online(timeout: float = 3.0) -> bool:
++    """Best-effort connectivity probe with a short timeout, so callers can
++    check up front whether it's worth calling the API at all instead of
++    waiting out a full request timeout before falling back to the cache."""
++    try:
++        requests.get("https://api.spoonacular.com", timeout=timeout)
++        return True
++    except (requests.exceptions.ConnectionError,
++            requests.exceptions.Timeout,
++            OSError):
++        return False
++    except Exception:
++        # Reached the network but got some other failure (e.g. non-2xx) —
++        # that still means the device is online.
++        return True
++
++
+ def get_recipes(items: list):
+     if not items:
+         return []
+@@ -52,58 +100,87 @@ def get_recipes(items: list):
+     except Exception as exc:
+         raise APIError("Could not parse API response as JSON") from exc
+ 
+-    recipes = []
++    entries = []
+     for entry in data:
+-        used_names   = [ing["name"] for ing in entry.get("usedIngredients",   [])]
+-        missed_names = [ing["name"] for ing in entry.get("missedIngredients", [])]
+-        recipes.append(Recipe(
+-            title=entry["title"],
+-            ingredients=used_names + missed_names,
+-            match_count=entry.get("usedIngredientCount", 0),
++        try:
++            used_names   = [ing["name"] for ing in entry.get("usedIngredients",   [])]
++            missed_names = [ing["name"] for ing in entry.get("missedIngredients", [])]
++            ingredients  = [clean_ingredient(n) for n in used_names + missed_names]
++            entries.append({
++                "recipe_id":   entry.get("id"),
++                "title":       entry["title"],
++                "ingredients": [i for i in ingredients if i],
++                "match_count": entry.get("usedIngredientCount", 0),
++            })
++        except Exception:
++            # malformed entry — skip it but keep whatever we've already collected
++            continue
++
++    if not entries:
++        return []
++
++    # findByIngredients doesn't return step-by-step instructions, so a second
++    # call to /recipes/{id}/information is needed per recipe. These are
++    # fetched concurrently rather than one at a time — sequentially, up to 5
++    # matched recipes at ~1-3s each would block the caller (the Tkinter GUI
++    # thread) for the sum of all of them; concurrently it's bounded by the
++    # slowest single call.
++    with ThreadPoolExecutor(max_workers=len(entries)) as executor:
++        instructions_list = list(
++            executor.map(lambda e: _fetch_instructions(e["recipe_id"]), entries)
++        )
++
++    return [
++        Recipe(
++            title=e["title"],
++            ingredients=e["ingredients"],
++            match_count=e["match_count"],
+             is_cached=False,
+-            id=entry.get("id"),
+-        ))
++            recipe_id=e["recipe_id"],
++            instructions=instructions,
++        )
++        for e, instructions in zip(entries, instructions_list)
++    ]
++
+ 
+-    return recipes
++_debug_printed = False
++_debug_lock = threading.Lock()
+ 
+ 
+-def get_recipe_details(recipe_id):
++def _fetch_instructions(recipe_id):
++    # Failures here are swallowed rather than raised, so one bad recipe
++    # doesn't cost the whole batch — it still gets cached, just with the
++    # model's default "No instructions available." text.
++    global _debug_printed
+     try:
+-        response = requests.get(
++        info_response = requests.get(
+             _INFO_URL.format(recipe_id),
+             params={"apiKey": API_KEY, "includeNutrition": "false"},
+             timeout=10,
+         )
+-    except (requests.exceptions.ConnectionError,
+-            requests.exceptions.Timeout,
+-            OSError) as exc:
+-        raise OfflineError("No internet connection") from exc
+-    except Exception as exc:
+-        raise APIError(f"Request failed: {exc}") from exc
+-
+-    if response.status_code != 200:
+-        raise APIError(
+-            f"Spoonacular returned {response.status_code}: {response.text[:200]}"
+-        )
+-
+-    try:
+-        data = response.json()
+-    except Exception as exc:
+-        raise APIError("Could not parse API response as JSON") from exc
+-
+-    ingredients = [
+-        ing["original"]
+-        for ing in data.get("extendedIngredients", [])
+-    ]
+-
+-    steps = []
+-    instructions = data.get("analyzedInstructions", [])
+-    if instructions:
+-        for step in instructions[0].get("steps", []):
+-            steps.append((step["number"], step["step"]))
+-
+-    return {
+-        "title": data.get("title", "Unknown"),
+-        "ingredients": ingredients,
+-        "steps": steps,
+-    }
++        if info_response.status_code != 200:
++            return None
++        info_data = info_response.json()
++
++        with _debug_lock:
++            if not _debug_printed:
++                _debug_printed = True
++                print(f"[DEBUG] raw /information response for recipe {recipe_id}: {info_data}")
++
++        # analyzedInstructions is a list of instruction groups; each group
++        # has a "steps" list of {"number": int, "step": str} dicts. Flatten
++        # the first group's steps into one newline-joined block (numbering
++        # is added at display time in gui.py).
++        analyzed = info_data.get("analyzedInstructions", [])
++        if analyzed and analyzed[0].get("steps"):
++            steps = [step["step"] for step in analyzed[0]["steps"]]
++            if steps:
++                return "\n".join(steps)
++
++        # Many Spoonacular recipes have no analyzedInstructions at all —
++        # fall back to the plain "instructions" field, which is usually
++        # raw HTML, and strip the tags out of it.
++        plain = _HTML_TAG_RE.sub("", info_data.get("instructions") or "").strip()
++        return plain or None
++    except Exception:
++        return None
+diff --git a/food_expiry_tracker/db_manager.py b/food_expiry_tracker/db_manager.py
+index 3ae28de..d54404f 100644
+--- a/food_expiry_tracker/db_manager.py
++++ b/food_expiry_tracker/db_manager.py
+@@ -1,11 +1,12 @@
+ import os
+ import sqlite3
+ import json
++from datetime import datetime
+ from models import FoodItem, Recipe
++from api import clean_ingredient
+ 
+ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "food_tracker.db")
+ 
+-
+ def create_connection():
+     conn = sqlite3.connect(DB_PATH)
+     return conn
+@@ -23,16 +24,84 @@ def create_table(conn):
+         )
+     """)
+ 
++    # Only the columns that were always part of the table are declared here.
++    # Everything the full recipe cache needs (recipe_id, ingredients,
++    # instructions, match_count, cached_at) is added by the migration step
++    # below, so a database created by an older version of the app gets
++    # upgraded in place instead of being dropped and losing its cached data.
+     cursor.execute("""
+         CREATE TABLE IF NOT EXISTS recipes (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            title TEXT NOT NULL
++        )
++    """)
++
++    # Migration: PRAGMA table_info() reports the columns the recipes table
++    # actually has right now. We ALTER TABLE to add whatever is missing
++    # rather than dropping and recreating the table, which would destroy any
++    # recipes already cached by an earlier version of the app.
++    cursor.execute("PRAGMA table_info(recipes)")
++    existing_columns = {row[1] for row in cursor.fetchall()}
++    required_columns = {
++        "recipe_id":    "INTEGER",
++        "ingredients":  "TEXT",
++        "instructions": "TEXT",
++        "match_count":  "INTEGER",
++        "cached_at":    "TEXT",
++    }
++    for column, col_type in required_columns.items():
++        if column not in existing_columns:
++            cursor.execute(f"ALTER TABLE recipes ADD COLUMN {column} {col_type}")
++
++    # A UNIQUE index (ALTER TABLE ADD COLUMN can't express a UNIQUE column
++    # constraint directly) lets insert_recipe() use INSERT OR REPLACE keyed
++    # on recipe_id, so re-fetching a recipe updates its cached row instead
++    # of inserting a duplicate.
++    cursor.execute(
++        "CREATE UNIQUE INDEX IF NOT EXISTS idx_recipes_recipe_id "
++        "ON recipes(recipe_id)"
++    )
++
++    cursor.execute("""
++        CREATE TABLE IF NOT EXISTS favourites (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             title TEXT NOT NULL,
+-            ingredients TEXT,
+-            match_count INTEGER,
+-            is_cached INTEGER
++            ingredients TEXT
+         )
+     """)
+ 
++    # day is UNIQUE so INSERT OR REPLACE can enforce one meal per day.
++    cursor.execute("""
++        CREATE TABLE IF NOT EXISTS meal_plan (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            day TEXT UNIQUE NOT NULL,
++            recipe_title TEXT NOT NULL
++        )
++    """)
++
++    conn.commit()
++
++    # One-time repair pass, run on every startup: earlier versions of the
++    # cache could store ingredients as raw JSON list text (brackets, quotes,
++    # \u-escapes) instead of clean comma-separated text. Re-clean every
++    # stored row through clean_ingredient() so old bad data gets fixed in
++    # place rather than staying broken until that recipe happens to be
++    # re-fetched.
++    _migrate_clean_ingredients(conn)
++
++
++def _migrate_clean_ingredients(conn):
++    cursor = conn.cursor()
++    cursor.execute("SELECT id, ingredients FROM recipes")
++    rows = cursor.fetchall()
++    for row_id, raw in rows:
++        cleaned_list = [clean_ingredient(i) for i in _parse_ingredients(raw)]
++        cleaned_str = ", ".join(i for i in cleaned_list if i)
++        if cleaned_str != (raw or ""):
++            cursor.execute(
++                "UPDATE recipes SET ingredients = ? WHERE id = ?",
++                (cleaned_str, row_id)
++            )
+     conn.commit()
+ 
+ 
+@@ -69,31 +138,186 @@ def update_item(conn, item_id, name, quantity, expiry_date):
+     conn.commit()
+ 
+ 
++def find_duplicate(conn, name, expiry_date):
++    # LOWER() on both sides makes the comparison case-insensitive so "apple",
++    # "Apple", and "APPLE" all match the same existing row.
++    cursor = conn.cursor()
++    cursor.execute(
++        "SELECT id, name, quantity, expiry_date FROM food_items "
++        "WHERE LOWER(name) = LOWER(?) AND expiry_date = ?",
++        (name, expiry_date)
++    )
++    row = cursor.fetchone()
++    if row is None:
++        return None
++    return FoodItem(item_id=row[0], name=row[1], quantity=row[2], expiry_date=row[3])
++
++
++def update_quantity(conn, item_id, new_quantity):
++    cursor = conn.cursor()
++    cursor.execute(
++        "UPDATE food_items SET quantity = ? WHERE id = ?",
++        (new_quantity, item_id)
++    )
++    conn.commit()
++
++
++def _parse_ingredients(raw):
++    # Rows cached by older versions of the app stored ingredients as a JSON
++    # array (json.dumps); the current format is a plain comma-separated
++    # string. Try JSON first so recipes cached before this migration still
++    # display correctly instead of being split apart character by character.
++    if not raw:
++        return []
++    raw = raw.strip()
++    if raw.startswith("["):
++        try:
++            return json.loads(raw)
++        except (ValueError, TypeError):
++            pass
++    return [i.strip() for i in raw.split(",") if i.strip()]
++
++
+ def insert_recipe(conn, recipe):
+     cursor = conn.cursor()
++    cached_at = datetime.today().strftime("%d/%m/%Y")
++    # ", ".join() on a list of already-clean strings — never str(list) or
++    # json.dumps() — so what lands in the column is plain "a, b, c" text,
++    # not "['a', 'b', 'c']". Each ingredient is run through clean_ingredient()
++    # first so stray brackets/quotes/escapes never make it into storage.
++    cleaned = [clean_ingredient(i) for i in recipe.ingredients] if recipe.ingredients else []
++    ingredients_str = ", ".join(i for i in cleaned if i)
++    # INSERT OR REPLACE is keyed on the recipe_id UNIQUE index set up in
++    # create_table(), so calling this again for a recipe already in the
++    # cache updates that row instead of inserting a duplicate copy.
+     cursor.execute(
+-        "INSERT INTO recipes (title, ingredients, match_count, is_cached) VALUES (?, ?, ?, ?)",
+-        (recipe.title, json.dumps(recipe.ingredients), recipe.match_count, int(recipe.is_cached))
++        """INSERT OR REPLACE INTO recipes
++           (recipe_id, title, ingredients, instructions, match_count, cached_at)
++           VALUES (?, ?, ?, ?, ?, ?)""",
++        (recipe.recipe_id, recipe.title, ingredients_str, recipe.instructions,
++         recipe.match_count, cached_at)
+     )
+     conn.commit()
+     return cursor.lastrowid
+-#json turns it into a string like thing for SQL-lite
++
+ 
+ def fetch_saved_recipes(conn):
+     cursor = conn.cursor()
+-    cursor.execute("SELECT title, ingredients, match_count, is_cached FROM recipes")
++    cursor.execute(
++        "SELECT recipe_id, title, ingredients, instructions, match_count, cached_at FROM recipes"
++    )
+     rows = cursor.fetchall()
+     return [
+         Recipe(
+-            title=row[0],
+-            ingredients=json.loads(row[1]) if row[1] else [],
+-            match_count=row[2],
+-            is_cached=bool(row[3])
++            recipe_id=row[0],
++            title=row[1],
++            ingredients=_parse_ingredients(row[2]),
++            instructions=row[3],
++            match_count=row[4] or 0,
++            is_cached=True,
+         )
+         for row in rows
+     ]
+ 
+ 
++def fetch_recipe_by_title(conn, title):
++    # LOWER() on both sides makes the lookup case-insensitive, matching the
++    # convention already used by find_duplicate() and find_favourite().
++    #
++    # Different Spoonacular recipe ids can share an identical title, so more
++    # than one row can match here (e.g. an old row cached before instructions
++    # existed, alongside a freshly re-fetched row for the same title with a
++    # different recipe_id). ORDER BY prefers a row that actually has
++    # recipe_id/instructions populated, then the most recently cached one —
++    # otherwise fetchone() would return whichever row SQLite happens to scan
++    # first (typically the oldest, least complete one).
++    cursor = conn.cursor()
++    cursor.execute(
++        "SELECT recipe_id, title, ingredients, instructions, match_count, cached_at "
++        "FROM recipes WHERE LOWER(title) = LOWER(?) "
++        "ORDER BY (recipe_id IS NOT NULL) DESC, (instructions IS NOT NULL) DESC, id DESC "
++        "LIMIT 1",
++        (title,)
++    )
++    row = cursor.fetchone()
++    if row is None:
++        return None
++    return Recipe(
++        recipe_id=row[0],
++        title=row[1],
++        ingredients=_parse_ingredients(row[2]),
++        instructions=row[3],
++        match_count=row[4] or 0,
++        is_cached=True,
++    )
++
++def insert_favourite(conn, recipe):
++    cursor = conn.cursor()
++    cursor.execute(
++        "INSERT INTO favourites (title, ingredients) VALUES (?, ?)",
++        (recipe.title, ", ".join(recipe.ingredients) if recipe.ingredients else "")
++    )
++    conn.commit()
++    return cursor.lastrowid
++
++
++def fetch_favourites(conn):
++    # recipe.id is set to the favourites DB primary key so the UI can call
++    # delete_favourite(conn, recipe.id) directly without a second lookup.
++    cursor = conn.cursor()
++    cursor.execute("SELECT id, title, ingredients FROM favourites")
++    rows = cursor.fetchall()
++    return [
++        Recipe(
++            id=row[0],
++            title=row[1],
++            ingredients=_parse_ingredients(row[2]),
++            match_count=0,
++            is_cached=True,
++        )
++        for row in rows
++    ]
++
++
++def delete_favourite(conn, recipe_id):
++    cursor = conn.cursor()
++    cursor.execute("DELETE FROM favourites WHERE id = ?", (recipe_id,))
++    conn.commit()
++
++
++def find_favourite(conn, title):
++    # LOWER() on both sides makes the title check case-insensitive so
++    # "Pasta" and "pasta" are treated as the same saved recipe.
++    cursor = conn.cursor()
++    cursor.execute(
++        "SELECT id FROM favourites WHERE LOWER(title) = LOWER(?)", (title,)
++    )
++    return cursor.fetchone() is not None
++
++
++def insert_meal(conn, day, recipe_title):
++    # INSERT OR REPLACE relies on the UNIQUE constraint on the day column.
++    # If a meal already exists for that day the existing row is replaced,
++    # enforcing the one-meal-per-day rule without a separate check.
++    cursor = conn.cursor()
++    cursor.execute(
++        "INSERT OR REPLACE INTO meal_plan (day, recipe_title) VALUES (?, ?)",
++        (day, recipe_title)
++    )
++    conn.commit()
++
++
++def fetch_meal_plan(conn):
++    cursor = conn.cursor()
++    cursor.execute("SELECT day, recipe_title FROM meal_plan")
++    return {row[0]: row[1] for row in cursor.fetchall()}
++
++
++def clear_meal(conn, day):
++    cursor = conn.cursor()
++    cursor.execute("DELETE FROM meal_plan WHERE day = ?", (day,))
++    conn.commit()
++
+ 
+ if __name__ == "__main__":
+     conn = create_connection()
+diff --git a/food_expiry_tracker/food_tracker.db b/food_expiry_tracker/food_tracker.db
+index 909a578..581d242 100644
+Binary files a/food_expiry_tracker/food_tracker.db and b/food_expiry_tracker/food_tracker.db differ
+diff --git a/food_expiry_tracker/gui.py b/food_expiry_tracker/gui.py
+index b247c04..1468fc9 100644
+--- a/food_expiry_tracker/gui.py
++++ b/food_expiry_tracker/gui.py
+@@ -1,8 +1,9 @@
+ # https://www.freecodecamp.org/news/python-gui-development-using-tkinter/
+ 
+-import tkinter as tk 
+-from tkinter import ttk, messagebox 
++import tkinter as tk
++from tkinter import ttk, messagebox
+ from datetime import datetime
++import threading
+ import db_manager as db
+ from models import FoodItem
+ import api
+@@ -50,6 +51,30 @@ def _attach_placeholder(entry: tk.Entry, placeholder: str):
+     entry.bind("<FocusIn>",  _focus_in)
+     entry.bind("<FocusOut>", _focus_out)
+ 
++
++def filter_items(items: list, query: str) -> list:
++    # Linear search: walk every element from index 0 to len-1, keeping those
++    # whose name contains the query as a substring (case-insensitive).
++    # Time complexity is O(n) — we inspect each FoodItem exactly once.
++    if not query:
++        return items  # empty query → no filtering, all items pass through
++
++    query_lower = query.lower()
++    result = []
++    for item in items:                          # one pass through the list
++        if query_lower in item.name.lower():    # substring check; both sides lowercased
++            result.append(item)                 # keep this item; move on to the next
++    return result
++
++
++def _match_count_text(match_count: int) -> str:
++    if match_count <= 0:
++        return "No direct matches"
++    if match_count == 1:
++        return "1 of your items matched"
++    return f"{match_count} of your items matched"
++
++
+ # TAB 1: Items Tab
+ 
+ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
+@@ -82,42 +107,62 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
+     tk.Label(add_section, text="Expiry Date:").grid(
+         row=2, column=0, sticky="nw", padx=(0, 8), pady=3)
+ 
+-    # plain text entry — can type a date or click a day on the calendar below
++    # Popup/modal calendar approach: the calendar opens in a separate Toplevel
++    # only when the user clicks the icon button, saving screen space in the main form.
+     expiry_entry = tk.Entry(add_section, width=12)
+     expiry_entry.insert(0, datetime.today().strftime("%d/%m/%Y"))
+     expiry_entry.grid(row=2, column=1, sticky="w", pady=3)
+ 
+-    # calendar embedded directly in the Add Item area (no separate window)
+     from tkcalendar import Calendar
+-    _today = datetime.today()
+-    _cal = Calendar(
+-        add_section,
+-        selectmode="day",
+-        year=_today.year,
+-        month=_today.month,
+-        day=_today.day,
+-        showweeknumbers=False,
+-        background="#4a4a4a",
+-        foreground="#ffffff",
+-        headersbackground="#d0d0d0",
+-        headersforeground="#000000",
+-        normalbackground="#ffffff",
+-        normalforeground="#000000",
+-        weekendbackground="#f0f0f0",
+-        weekendforeground="#333333",
+-        othermonthforeground="#aaaaaa",
+-        selectbackground="#1565C0",
+-        selectforeground="#ffffff",
+-    )
+-    _cal.grid(row=3, column=0, columnspan=2, pady=(4, 8))
+ 
+-    def _on_cal_select(_event=None):
+-        selected = _cal.selection_get()
+-        if selected:
+-            expiry_entry.delete(0, tk.END)
+-            expiry_entry.insert(0, selected.strftime("%d/%m/%Y"))
++    def _open_cal_popup():
++        popup = tk.Toplevel(add_section)
++        popup.grab_set()
++        popup.resizable(False, False)
++        popup.title("")
+ 
+-    _cal.bind("<<CalendarSelected>>", _on_cal_select)
++        try:
++            _sel = datetime.strptime(expiry_entry.get().strip(), "%d/%m/%Y")
++        except ValueError:
++            _sel = datetime.today()
++
++        _cal = Calendar(
++            popup,
++            selectmode="day",
++            year=_sel.year,
++            month=_sel.month,
++            day=_sel.day,
++            showweeknumbers=False,
++            background="#4a4a4a",
++            foreground="#ffffff",
++            headersbackground="#d0d0d0",
++            headersforeground="#000000",
++            normalbackground="#ffffff",
++            normalforeground="#000000",
++            weekendbackground="#f0f0f0",
++            weekendforeground="#333333",
++            othermonthforeground="#aaaaaa",
++            selectbackground="#1565C0",
++            selectforeground="#ffffff",
++        )
++        _cal.pack(padx=4, pady=4)
++
++        def _on_select(_event=None):
++            selected = _cal.selection_get()
++            if selected:
++                expiry_entry.delete(0, tk.END)
++                expiry_entry.insert(0, selected.strftime("%d/%m/%Y"))
++                popup.destroy()
++
++        _cal.bind("<<CalendarSelected>>", _on_select)
++
++        # Position the popup just below the calendar button
++        bx = cal_btn.winfo_rootx()
++        by = cal_btn.winfo_rooty() + cal_btn.winfo_height()
++        popup.geometry(f"+{bx}+{by}")
++
++    cal_btn = tk.Button(add_section, text="📅", command=_open_cal_popup, padx=2, pady=1)
++    cal_btn.grid(row=2, column=2, sticky="w", padx=(4, 0), pady=3)
+ 
+ 
+     # sorting by section
+@@ -129,6 +174,11 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
+     list_section = tk.LabelFrame(tab, text=" Items ", padx=4, pady=4)
+     list_section.pack(fill="both", expand=True, pady=(0, 6))
+ 
++    # Search bar — sits directly above the Treeview inside the Items section
++    search_entry = tk.Entry(list_section, fg="grey")
++    search_entry.pack(fill="x", padx=2, pady=(2, 4))
++    _attach_placeholder(search_entry, "Search by name...")
++
+     #keeps the scrollbar and listbox together
+     tree_frame = tk.Frame(list_section)
+     tree_frame.pack(fill="both", expand=True)
+@@ -209,6 +259,7 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
+     warning_label.pack(fill="x")
+ 
+     _sort_key = "days"
++    _all_items = []        # last fetched+sorted list; filtered in memory for search
+     checked_items = set()
+     editing_item_id = None
+ 
+@@ -267,6 +318,7 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
+ 
+ 
+     def refresh_listbox():
++        nonlocal _all_items
+         items = db.fetch_all_items(conn)
+         key = _sort_key
+         if key == "days":
+@@ -275,7 +327,17 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
+             items.sort(key=lambda it: (it.name.lower(), it.days_remaining()))
+         elif key == "qty":
+             items.sort(key=lambda it: (it.quantity, it.name.lower()))
+-        _populate_tree(items)
++        _all_items = items
++        _apply_search()
++
++    def _current_search_query() -> str:
++        raw = search_entry.get()
++        # treat placeholder text as no query
++        return "" if raw == "Search by name..." else raw.strip()
++
++    def _apply_search():
++        filtered = filter_items(_all_items, _current_search_query())
++        _populate_tree(filtered)
+ 
+     def _sort_by(key: str):
+         nonlocal _sort_key
+@@ -315,7 +377,6 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
+         _now = datetime.today()
+         expiry_entry.delete(0, tk.END)
+         expiry_entry.insert(0, _now.strftime("%d/%m/%Y"))
+-        _cal.selection_set(_now)
+ 
+         # and switches the form back to "add a new item" mode
+         editing_item_id = None
+@@ -328,9 +389,21 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
+         name_val, qty_val, expiry_val = result
+ 
+         if editing_item_id is None:
+-            # ADD MODE: no existing row is selected, so insert a brand new item
+-            item = FoodItem(item_id=None, name=name_val, quantity=qty_val, expiry_date=expiry_val)
+-            db.insert_item(conn, item)
++            # Duplicate detection: check for an existing row with the same name
++            # (case-insensitive) and expiry date before inserting a new one.
++            duplicate = db.find_duplicate(conn, name_val, expiry_val)
++            if duplicate is not None:
++                # Merge: add the entered quantity to the existing row instead of
++                # creating a second row for the same item.
++                new_qty = duplicate.quantity + qty_val
++                db.update_quantity(conn, duplicate.item_id, new_qty)
++                messagebox.showinfo(
++                    "Quantity Updated",
++                    f"Quantity updated: {duplicate.name} now has {new_qty} in stock"
++                )
++            else:
++                item = FoodItem(item_id=None, name=name_val, quantity=qty_val, expiry_date=expiry_val)
++                db.insert_item(conn, item)
+         else:
+             # EDIT MODE: overwrite the row that was loaded by _start_edit
+             db.update_item(conn, editing_item_id, name_val, qty_val, expiry_val)
+@@ -351,13 +424,11 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
+         qty_entry.insert(0, str(qty_val))
+         qty_entry.config(fg="black")
+ 
+-        _dt = datetime.strptime(expiry_val, "%d/%m/%Y")
+         expiry_entry.delete(0, tk.END)
+         expiry_entry.insert(0, expiry_val)
+-        _cal.selection_set(_dt)
+ 
+-        editing_item_id[0] = int(row_id)
+-        save_button.config(text="Save Changes")
++        editing_item_id = int(row_id)
++        save_button.config(text="SAVE CHANGES")
+ 
+     def _on_tree_click(event):
+         if tree.identify_region(event.x, event.y) != "cell":
+@@ -397,6 +468,17 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
+         checked_items.clear()
+         refresh_listbox()
+ 
++    def _show_cached_recipes():
++        cached = db.fetch_saved_recipes(conn)
++        if not cached:
++            update_recipes(
++                [],
++                note="No cached recipes available. Connect to the internet to fetch recipes."
++            )
++        else:
++            update_recipes(cached, note="Showing cached recipes — you are offline")
++        notebook.select(1)
++
+     def _on_get_recipes():
+         all_items = db.fetch_all_items(conn)
+         if checked_items:
+@@ -409,25 +491,64 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
+             messagebox.showinfo("No Items", "Add some food items first.")
+             return
+ 
+-        try:
+-            recipes = api.get_recipes(items_to_use)
++        # api.is_online() and api.get_recipes() are blocking network calls —
++        # up to several seconds each, and get_recipes() alone makes up to 5
++        # more of them for recipe instructions. Running them on the main
++        # thread freezes the whole GUI for that entire duration (worse the
++        # more ingredients are selected, since Spoonacular is more likely to
++        # return the full 5 matches). They run on a background thread here;
++        # only the thread-safe work — touching `conn` and Tkinter widgets —
++        # happens back on the main thread via `tab.after()`.
++        recipes_button.config(state="disabled", text="Loading…")
++
++        def _reset_button():
++            recipes_button.config(state="normal", text="GET RECIPES")
++
++        def _finish_online(recipes):
+             if checked_items:
+                 for r in recipes:
+                     r.is_manual_selection = True
+ 
+             recipes.sort(key=lambda r: r.match_count, reverse=True)
++
++            # The cache is written before anything is displayed. This
++            # guarantees the offline fallback always has data for any
++            # recipe that has ever been successfully fetched, without
++            # needing a separate "sync" step.
+             for r in recipes:
+                 db.insert_recipe(conn, r)
+-            update_recipes(recipes)
+-            notebook.select(1)
+ 
+-        except api.OfflineError:
+-            cached = db.fetch_saved_recipes(conn)
+-            update_recipes(cached, note="Showing cached recipes")
++            # Re-read from the cache rather than displaying the raw API
++            # objects directly, so the display path is identical whether
++            # the data came from the network or from disk.
++            display_recipes = [db.fetch_recipe_by_title(conn, r.title) for r in recipes]
++            update_recipes(display_recipes)
+             notebook.select(1)
++            _reset_button()
++
++        def _finish_offline():
++            _show_cached_recipes()
++            _reset_button()
+ 
+-        except api.APIError as exc:
++        def _finish_error(exc):
+             messagebox.showerror("API Error", str(exc))
++            _reset_button()
++
++        def _worker():
++            # Check connectivity up front rather than waiting out a request
++            # timeout before falling back to the cache.
++            if not api.is_online():
++                tab.after(0, _finish_offline)
++                return
++            try:
++                recipes = api.get_recipes(items_to_use)
++                tab.after(0, _finish_online, recipes)
++            except api.OfflineError:
++                tab.after(0, _finish_offline)
++            except api.APIError as exc:
++                tab.after(0, _finish_error, exc)
++
++        threading.Thread(target=_worker, daemon=True).start()
+ 
+     # ADD ITEM / SAVE CHANGES button
+     save_button = tk.Button(
+@@ -436,12 +557,13 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
+         padx=10, pady=4,
+         command=_on_save,
+     )
+-    save_button.grid(row=4, column=1, sticky="e", pady=(8, 0))
++    save_button.grid(row=3, column=1, sticky="e", pady=(8, 0))
+ 
+     remove_button.config(command=_on_remove_selected)
+     recipes_button.config(command=_on_get_recipes)
+ 
+     tree.bind("<Button-1>", _on_tree_click)
++    search_entry.bind("<KeyRelease>", lambda _event: _apply_search())
+ 
+     for _sort_label, _key in (
+         ("Name",        "name"),
+@@ -506,42 +628,195 @@ def _build_details_tab(notebook: ttk.Notebook):
+     return tab, update_details
+ 
+ 
+-def _build_recipes_tab(notebook: ttk.Notebook, update_details=None, details_tab=None):
++def _build_recipes_tab(notebook: ttk.Notebook, conn, update_details=None, details_tab=None):
++    # The outer tab holds a nested ttk.Notebook. Each sub-tab handles one
++    # stage of the recipe workflow: discover → save to favourites → plan meals.
+     tab = ttk.Frame(notebook, padding=8)
++    inner_nb = ttk.Notebook(tab)
++    inner_nb.pack(fill="both", expand=True)
++
++    DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
++
++    # ──────────────── SUB-TAB 2: FAVOURITES ────────────────────────────────────
++    # Built before SUGGESTIONS so refresh_favs() is already defined when the
++    # "Save to Favourites" callback in SUGGESTIONS needs to call it.
++    fav_tab = ttk.Frame(inner_nb, padding=8)
++
++    tk.Label(fav_tab, text="Saved Favourites",
++             font=("TkDefaultFont", 13, "bold")).pack(anchor="w", pady=(0, 6))
++
++    fav_list_frame = tk.Frame(fav_tab)
++    fav_list_frame.pack(fill="x")
++
++    fav_listbox = tk.Listbox(fav_list_frame, height=8, selectmode="single",
++                             exportselection=False)
++    fav_scroll = ttk.Scrollbar(fav_list_frame, orient="vertical",
++                               command=fav_listbox.yview)
++    fav_listbox.configure(yscrollcommand=fav_scroll.set)
++    fav_listbox.pack(side="left", fill="x", expand=True)
++    fav_scroll.pack(side="right", fill="y")
++
++    tk.Label(fav_tab, text="Ingredients:",
++             font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(8, 2))
++
++    ing_frame = tk.Frame(fav_tab)
++    ing_frame.pack(fill="both", expand=True)
++
++    ing_text = tk.Text(ing_frame, height=6, state="disabled", wrap="word",
++                       relief="solid", bd=1, font=("TkDefaultFont", 10))
++    ing_scroll = ttk.Scrollbar(ing_frame, orient="vertical", command=ing_text.yview)
++    ing_text.configure(yscrollcommand=ing_scroll.set)
++    ing_text.pack(side="left", fill="both", expand=True)
++    ing_scroll.pack(side="right", fill="y")
++
++    fav_btn_frame = tk.Frame(fav_tab)
++    fav_btn_frame.pack(fill="x", pady=(8, 0))
++
++    # _fav_data keeps the fetched Recipe list in sync with the Listbox index so
++    # we can look up the DB id for deletion without a second query.
++    _fav_data = []
++
++    def refresh_favs():
++        nonlocal _fav_data
++        _fav_data = db.fetch_favourites(conn)
++        fav_listbox.delete(0, tk.END)
++        for r in _fav_data:
++            fav_listbox.insert(tk.END, r.title)
++        ing_text.config(state="normal")
++        ing_text.delete("1.0", tk.END)
++        ing_text.config(state="disabled")
++
++    def _on_fav_select(_event=None):
++        sel = fav_listbox.curselection()
++        if not sel:
++            return
++        recipe = _fav_data[sel[0]]
++        # The favourites table only stores title + ingredients; instructions
++        # are pulled from the recipes cache (keyed by title) so favourites
++        # show full details offline too.
++        cached = db.fetch_recipe_by_title(conn, recipe.title)
++        ing_text.config(state="normal")
++        ing_text.delete("1.0", tk.END)
++        for ing in (recipe.ingredients or []):
++            ing_text.insert(tk.END, f"• {ing}\n")
++        ing_text.insert(tk.END, "\nINSTRUCTIONS\n")
++        ing_text.insert(tk.END, (cached.instructions if cached else "No instructions available.") + "\n")
++        ing_text.config(state="disabled")
++
++    fav_listbox.bind("<<ListboxSelect>>", _on_fav_select)
++
++    # ──────────────── SUB-TAB 3: MEAL PLANNER ──────────────────────────────────
++    # Built before SUGGESTIONS so refresh_meal() is defined before the
++    # "Add to Meal Plan" button in the Favourites tab needs to call it.
++    meal_tab = ttk.Frame(inner_nb, padding=8)
++
++    tk.Label(meal_tab, text="Weekly Meal Plan",
++             font=("TkDefaultFont", 13, "bold")).pack(anchor="w", pady=(0, 8))
++
++    grid_frame = tk.Frame(meal_tab)
++    grid_frame.pack(fill="x")
++
++    # One StringVar per day drives the displayed recipe title in each slot.
++    # Updating the var is enough to refresh the UI without rebuilding widgets.
++    day_title_vars = {}
++
++    for col, day in enumerate(DAYS):
++        slot = tk.LabelFrame(grid_frame, text=day[:3], padx=4, pady=4)
++        slot.grid(row=0, column=col, padx=2, pady=4, sticky="n")
++
++        var = tk.StringVar(value="—")
++        day_title_vars[day] = var
++
++        day_label = tk.Label(slot, textvariable=var, wraplength=68, justify="center",
++                             width=8, font=("TkDefaultFont", 9), cursor="hand2")
++        day_label.pack()
++
++        def _make_day_click(d=day):
++            def _on_day_click(_event=None):
++                title = day_title_vars[d].get()
++                if title == "—" or update_details is None or details_tab is None:
++                    return
++                # Meal plan slots only store a day + recipe title; the
++                # ingredients/instructions shown here are pulled from the
++                # recipes cache so this works offline too.
++                cached = db.fetch_recipe_by_title(conn, title)
++                if cached is None:
++                    update_details(title, error="No cached details available for this recipe.")
++                else:
++                    steps = [
++                        (i + 1, step)
++                        for i, step in enumerate(cached.instructions.split("\n"))
++                        if step.strip()
++                    ]
++                    update_details(cached.title, ingredients=cached.ingredients, steps=steps)
++                notebook.select(details_tab)
++            return _on_day_click
++
++        day_label.bind("<Button-1>", _make_day_click())
++
++        def _make_clear(d=day):
++            def _do_clear():
++                db.clear_meal(conn, d)
++                day_title_vars[d].set("—")
++            return _do_clear
++
++        tk.Button(slot, text="Clear", command=_make_clear(), pady=1,
++                  font=("TkDefaultFont", 8)).pack(pady=(4, 0))
+ 
+-    tk.Label(tab, text="Recipe Suggestions",
+-             font=("TkDefaultFont", 14, "bold")).pack(anchor="w", pady=(0, 6))
++    def refresh_meal():
++        plan = db.fetch_meal_plan(conn)
++        for d in DAYS:
++            day_title_vars[d].set(plan.get(d, "—"))
++
++    # Load persisted meal plan from DB on startup so the plan survives restarts.
++    refresh_meal()
++
++    # ──────────────── SUB-TAB 1: SUGGESTIONS ───────────────────────────────────
++    sug_tab = ttk.Frame(inner_nb, padding=8)
++
++    tk.Label(sug_tab, text="Recipe Suggestions",
++             font=("TkDefaultFont", 13, "bold")).pack(anchor="w", pady=(0, 4))
+ 
+     note_label = tk.Label(
+-        tab, text="",
++        sug_tab, text="",
+         bg="#fff3cd", fg="#856404",
+         anchor="w", padx=8, pady=4,
+         relief="solid", bd=1,
+     )
+ 
+     current_recipes = [[]]
+-    selected_idx    = [None] 
++    selected_idx    = [None]
+ 
+-    recipe_widgets = []
++    # card_widgets holds per-card references so update_recipes() can repopulate
++    # all three cards without rebuilding frames.
++    card_widgets = []
+ 
+     for i in range(3):
+-        lframe = tk.LabelFrame(tab, text=f" Recipe {i + 1} ", padx=8, pady=8)
++        lframe = tk.LabelFrame(sug_tab, text=f" Recipe {i + 1} ", padx=8, pady=6)
+         lframe.pack(fill="x", pady=4)
+ 
+-        title_lbl = tk.Label(lframe, text="Recipe title will appear here",
+-                             font=("TkDefaultFont", 11, "bold"))
++        title_lbl = tk.Label(lframe, text="—",
++                             font=("TkDefaultFont", 11, "bold"), anchor="w")
+         title_lbl.pack(anchor="w")
+ 
+-        detail_lbl = tk.Label(lframe,
+-                              text="Ingredients and details will be listed here.",
+-                              wraplength=480, justify="left")
+-        detail_lbl.pack(anchor="w", pady=(2, 0))
++        # Small grey subtitle showing the match count instead of the full
++        # ingredient list — gives a quick relevance signal at a glance
++        # without cluttering the card; the full list is still one click
++        # away in the Recipe Details panel.
++        match_lbl = tk.Label(lframe, text="", wraplength=480, justify="left",
++                             anchor="w", font=("TkDefaultFont", 9), fg="grey")
++        match_lbl.pack(anchor="w", pady=(2, 4))
++
++        save_var = tk.StringVar(value="♡ Save to Favourites")
++        save_btn = tk.Button(lframe, textvariable=save_var, padx=6, pady=2,
++                             state="disabled")
++        save_btn.pack(anchor="e")
+ 
+-        recipe_widgets.append((lframe, title_lbl, detail_lbl))
++        card_widgets.append((lframe, title_lbl, match_lbl, save_btn, save_var))
+ 
+     def _select_slot(idx):
+         selected_idx[0] = idx
+-        for j, (lf, _, _) in enumerate(recipe_widgets):
++        for j, (lf, *_) in enumerate(card_widgets):
+             lf.config(relief="solid" if j == idx else "groove")
+ 
+         if update_details is None or details_tab is None:
+@@ -551,77 +826,124 @@ def _build_recipes_tab(notebook: ttk.Notebook, update_details=None, details_tab=
+             return
+         r = recipes[idx]
+ 
+-        if r.id is None:
+-            update_details(
+-                r.title,
+-                error="Full details not available for cached recipes (no Spoonacular ID).",
+-            )
+-            notebook.select(details_tab)
+-            return
+-
+-        try:
+-            details = api.get_recipe_details(r.id)
+-            update_details(
+-                details["title"],
+-                ingredients=details["ingredients"],
+-                steps=details["steps"],
+-            )
+-        except (api.OfflineError, api.APIError):
+-            update_details(
+-                r.title,
+-                error="Could not load full recipe (offline or API error).",
+-            )
++        # r is always a cache-backed Recipe (either just re-read from the
++        # cache after a fetch, or loaded via db.fetch_saved_recipes when
++        # offline), so this never needs to call the API again — it works
++        # identically online and offline.
++        steps = [
++            (i + 1, step)
++            for i, step in enumerate(r.instructions.split("\n"))
++            if step.strip()
++        ]
++        update_details(r.title, ingredients=r.ingredients, steps=steps)
+         notebook.select(details_tab)
+ 
+-    for i, (lf, title_lbl, detail_lbl) in enumerate(recipe_widgets):
+-        for widget in (lf, title_lbl, detail_lbl):
+-            widget.bind("<Button-1>", lambda _, idx=i: _select_slot(idx))
+-
+-    def _on_show_instructions():
+-        idx = selected_idx[0]
+-        if idx is None:
+-            messagebox.showinfo("No Selection", "Click a recipe box to select it first.")
+-            return
+-        recipes = current_recipes[0]
+-        if not recipes or idx >= len(recipes):
+-            messagebox.showinfo("No Recipe", "No recipe loaded in that slot.")
+-            return
+-        r = recipes[idx]
+-        body = (
+-            "\n".join(f"• {ing}" for ing in r.ingredients)
+-            if r.ingredients else "No ingredients available."
+-        )
+-        messagebox.showinfo(r.title, body)
+-
+-    # SELECT TO SEE INSTRUCTIONS button
+-    tk.Button(
+-        tab, text="SELECT TO SEE INSTRUCTIONS",
+-        bg="#1565C0", fg="black", activebackground="#0d47a1",
+-        padx=12, pady=6,
+-        command=_on_show_instructions,
+-    ).pack(anchor="w", pady=(12, 0))
++    def _make_save_cb(idx):
++        def _save():
++            recipes = current_recipes[0]
++            if idx >= len(recipes):
++                return
++            recipe = recipes[idx]
++            # Case-insensitive duplicate check before inserting into favourites.
++            if db.find_favourite(conn, recipe.title):
++                messagebox.showinfo("Already Saved", "Already in favourites")
++                return
++            db.insert_favourite(conn, recipe)
++            _, _, _, btn, var = card_widgets[idx]
++            var.set("✓ Saved")
++            btn.config(state="disabled")
++            messagebox.showinfo("Saved", "Recipe saved to favourites")
++            refresh_favs()
++        return _save
++
++    for i, (lf, title_lbl, match_lbl, save_btn, save_var) in enumerate(card_widgets):
++        save_btn.config(command=_make_save_cb(i))
++        for w in (lf, title_lbl, match_lbl):
++            w.bind("<Button-1>", lambda _, idx=i: _select_slot(idx))
+ 
+     def update_recipes(recipes: list, note: str = None):
++        # ttk.Notebook remembers whichever sub-tab was last selected (e.g.
++        # FAVOURITES), so without this a new GET RECIPES result would land
++        # under the RECIPES tab without actually being visible. Explicitly
++        # reselect SUGGESTIONS so the new results are always shown.
++        inner_nb.select(sug_tab)
+         current_recipes[0] = recipes
+         selected_idx[0] = None
+         if note:
+             note_label.config(text=f"ℹ  {note}")
+-            note_label.pack(fill="x", pady=(0, 6), before=recipe_widgets[0][0])
++            note_label.pack(fill="x", pady=(0, 6), before=card_widgets[0][0])
+         else:
+             note_label.pack_forget()
+ 
+-        for i, (lf, title_lbl, detail_lbl) in enumerate(recipe_widgets):
++        for i, (lf, title_lbl, match_lbl, save_btn, save_var) in enumerate(card_widgets):
+             lf.config(relief="groove")
+             if i < len(recipes):
+                 r = recipes[i]
+                 title_lbl.config(text=r.title)
+-                detail_lbl.config(
+-                    text=f"{r.match_count} ingredient(s) matched"
+-                         + (" (cached)" if r.is_cached else "")
+-                )
++                match_lbl.config(text=_match_count_text(r.match_count))
++                save_var.set("♡ Save to Favourites")
++                save_btn.config(state="normal")
+             else:
+                 title_lbl.config(text="—")
+-                detail_lbl.config(text="")
++                match_lbl.config(text="")
++                save_btn.config(state="disabled")
++
++    # ── FAVOURITES TAB: wire buttons (needs refresh_meal from meal planner) ───
++    def _on_add_to_meal():
++        sel = fav_listbox.curselection()
++        if not sel:
++            messagebox.showinfo("No Selection", "Click a recipe in the list first.")
++            return
++        recipe = _fav_data[sel[0]]
++
++        popup = tk.Toplevel(fav_tab)
++        popup.title("Add to Meal Plan")
++        popup.grab_set()
++        popup.resizable(False, False)
++
++        tk.Label(popup, text=f"Add  '{recipe.title}'  to which day?",
++                 padx=12, pady=8).pack()
++
++        day_var = tk.StringVar(value=DAYS[0])
++        combo = ttk.Combobox(popup, textvariable=day_var, values=DAYS,
++                             state="readonly", width=14)
++        combo.pack(padx=12, pady=(0, 8))
++
++        def _confirm():
++            db.insert_meal(conn, day_var.get(), recipe.title)
++            refresh_meal()
++            popup.destroy()
++            messagebox.showinfo("Meal Plan",
++                                f"'{recipe.title}' added to {day_var.get()}")
++
++        tk.Button(popup, text="Add", command=_confirm,
++                  padx=8, pady=4).pack(pady=(0, 10))
++
++        bx = fav_btn_frame.winfo_rootx()
++        by = fav_btn_frame.winfo_rooty()
++        popup.geometry(f"+{bx}+{by}")
++
++    def _on_remove_fav():
++        sel = fav_listbox.curselection()
++        if not sel:
++            messagebox.showinfo("No Selection", "Click a recipe to select it first.")
++            return
++        recipe = _fav_data[sel[0]]
++        db.delete_favourite(conn, recipe.id)
++        refresh_favs()
++
++    tk.Button(fav_btn_frame, text="Add to Meal Plan",
++              command=_on_add_to_meal, padx=8, pady=4).pack(side="left", padx=(0, 8))
++    tk.Button(fav_btn_frame, text="Remove from Favourites",
++              command=_on_remove_fav, padx=8, pady=4).pack(side="left")
++
++    # Load favourites from DB on startup so saved recipes persist across restarts.
++    refresh_favs()
++
++    # Add sub-tabs to inner notebook in the order the user sees them.
++    inner_nb.add(sug_tab,  text=" SUGGESTIONS ")
++    inner_nb.add(fav_tab,  text=" FAVOURITES ")
++    inner_nb.add(meal_tab, text=" MEAL PLANNER ")
+ 
+     return tab, update_recipes
+ 
+@@ -643,7 +965,7 @@ def main():
+ 
+     details_frame, update_details = _build_details_tab(notebook)
+     recipes_frame, update_recipes = _build_recipes_tab(
+-        notebook, update_details=update_details, details_tab=details_frame
++        notebook, conn, update_details=update_details, details_tab=details_frame
+     )
+     _build_items_tab(notebook, conn, update_recipes)
+     notebook.add(recipes_frame, text=" RECIPES ")
+diff --git a/food_expiry_tracker/models.py b/food_expiry_tracker/models.py
+index f864176..9d060b1 100644
+--- a/food_expiry_tracker/models.py
++++ b/food_expiry_tracker/models.py
+@@ -26,14 +26,19 @@ class FoodItem:
+ 
+ class Recipe:
+ 
+-    def __init__(self, title: str, ingredients: list[str], match_count: int = 0, is_cached: bool = False, id: int = None):
++    def __init__(self, title: str, ingredients: list[str], match_count: int = 0, is_cached: bool = False,
++                 id: int = None, recipe_id: int = None, instructions: str = None):
+         self.id = id
++        # the Spoonacular recipe id — used as the cache key in the recipes table
++        self.recipe_id = recipe_id
+         self.title = title
+         self.ingredients = ingredients
+         # number of food items chosen to load recipe
+         self.match_count = match_count
+-        # true when this recipe was loaded from a local cache 
++        # true when this recipe was loaded from a local cache
+         self.is_cached = is_cached
++        # default so the UI never shows a blank instructions panel
++        self.instructions = instructions if instructions else "No instructions available."
+ 
+     def match_score(self, items: list[FoodItem]):
+         item_names = {item.name.lower() for item in items}

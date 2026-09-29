@@ -1,8 +1,9 @@
 # https://www.freecodecamp.org/news/python-gui-development-using-tkinter/
 
-import tkinter as tk 
-from tkinter import ttk, messagebox 
+import tkinter as tk
+from tkinter import ttk, messagebox
 from datetime import datetime
+import threading
 import db_manager as db
 from models import FoodItem
 import api
@@ -50,6 +51,27 @@ def _attach_placeholder(entry: tk.Entry, placeholder: str):
     entry.bind("<FocusIn>",  _focus_in)
     entry.bind("<FocusOut>", _focus_out)
 
+
+def filter_items(items: list, query: str):
+    if not query:
+        return items 
+
+    query_lower = query.lower()
+    result = []
+    for item in items:                          
+        if query_lower in item.name.lower():    
+            result.append(item)                 
+    return result
+
+
+def _match_count_text(match_count: int):
+    if match_count <= 0:
+        return "No direct matches"
+    if match_count == 1:
+        return "1 of your items matched"
+    return f"{match_count} of your items matched"
+
+
 # TAB 1: Items Tab
 
 def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
@@ -81,43 +103,60 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
     # expiry date input field LABEL
     tk.Label(add_section, text="Expiry Date:").grid(
         row=2, column=0, sticky="nw", padx=(0, 8), pady=3)
-
-    # plain text entry — can type a date or click a day on the calendar below
     expiry_entry = tk.Entry(add_section, width=12)
     expiry_entry.insert(0, datetime.today().strftime("%d/%m/%Y"))
     expiry_entry.grid(row=2, column=1, sticky="w", pady=3)
 
-    # calendar embedded directly in the Add Item area (no separate window)
     from tkcalendar import Calendar
-    _today = datetime.today()
-    _cal = Calendar(
-        add_section,
-        selectmode="day",
-        year=_today.year,
-        month=_today.month,
-        day=_today.day,
-        showweeknumbers=False,
-        background="#4a4a4a",
-        foreground="#ffffff",
-        headersbackground="#d0d0d0",
-        headersforeground="#000000",
-        normalbackground="#ffffff",
-        normalforeground="#000000",
-        weekendbackground="#f0f0f0",
-        weekendforeground="#333333",
-        othermonthforeground="#aaaaaa",
-        selectbackground="#1565C0",
-        selectforeground="#ffffff",
-    )
-    _cal.grid(row=3, column=0, columnspan=2, pady=(4, 8))
 
-    def _on_cal_select(_event=None):
-        selected = _cal.selection_get()
-        if selected:
-            expiry_entry.delete(0, tk.END)
-            expiry_entry.insert(0, selected.strftime("%d/%m/%Y"))
+    def _open_cal_popup():
+        popup = tk.Toplevel(add_section)
+        popup.grab_set()
+        popup.resizable(False, False)
+        popup.title("")
 
-    _cal.bind("<<CalendarSelected>>", _on_cal_select)
+        try:
+            _sel = datetime.strptime(expiry_entry.get().strip(), "%d/%m/%Y")
+        except ValueError:
+            _sel = datetime.today()
+
+        _cal = Calendar(
+            popup,
+            selectmode="day",
+            year=_sel.year,
+            month=_sel.month,
+            day=_sel.day,
+            showweeknumbers=False,
+            background="#4a4a4a",
+            foreground="#ffffff",
+            headersbackground="#d0d0d0",
+            headersforeground="#000000",
+            normalbackground="#ffffff",
+            normalforeground="#000000",
+            weekendbackground="#f0f0f0",
+            weekendforeground="#333333",
+            othermonthforeground="#aaaaaa",
+            selectbackground="#1565C0",
+            selectforeground="#ffffff",
+        )
+        _cal.pack(padx=4, pady=4)
+
+        def _on_select(_event=None):
+            selected = _cal.selection_get()
+            if selected:
+                expiry_entry.delete(0, tk.END)
+                expiry_entry.insert(0, selected.strftime("%d/%m/%Y"))
+                popup.destroy()
+
+        _cal.bind("<<CalendarSelected>>", _on_select)
+
+        # Position the popup just below the calendar button
+        bx = cal_btn.winfo_rootx()
+        by = cal_btn.winfo_rooty() + cal_btn.winfo_height()
+        popup.geometry(f"+{bx}+{by}")
+
+    cal_btn = tk.Button(add_section, text="📅", command=_open_cal_popup, padx=2, pady=1)
+    cal_btn.grid(row=2, column=2, sticky="w", padx=(4, 0), pady=3)
 
 
     # sorting by section
@@ -128,6 +167,11 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
 
     list_section = tk.LabelFrame(tab, text=" Items ", padx=4, pady=4)
     list_section.pack(fill="both", expand=True, pady=(0, 6))
+
+    # Search bar — sits directly above the Treeview inside the Items section
+    search_entry = tk.Entry(list_section, fg="grey")
+    search_entry.pack(fill="x", padx=2, pady=(2, 4))
+    _attach_placeholder(search_entry, "Search by name...")
 
     #keeps the scrollbar and listbox together
     tree_frame = tk.Frame(list_section)
@@ -209,6 +253,7 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
     warning_label.pack(fill="x")
 
     _sort_key = "days"
+    _all_items = []     
     checked_items = set()
     editing_item_id = None
 
@@ -267,6 +312,7 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
 
 
     def refresh_listbox():
+        nonlocal _all_items
         items = db.fetch_all_items(conn)
         key = _sort_key
         if key == "days":
@@ -275,7 +321,16 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
             items.sort(key=lambda it: (it.name.lower(), it.days_remaining()))
         elif key == "qty":
             items.sort(key=lambda it: (it.quantity, it.name.lower()))
-        _populate_tree(items)
+        _all_items = items
+        _apply_search()
+
+    def _current_search_query() :
+        raw = search_entry.get()
+        return "" if raw == "Search by name..." else raw.strip()
+
+    def _apply_search():
+        filtered = filter_items(_all_items, _current_search_query())
+        _populate_tree(filtered)
 
     def _sort_by(key: str):
         nonlocal _sort_key
@@ -315,7 +370,6 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
         _now = datetime.today()
         expiry_entry.delete(0, tk.END)
         expiry_entry.insert(0, _now.strftime("%d/%m/%Y"))
-        _cal.selection_set(_now)
 
         # and switches the form back to "add a new item" mode
         editing_item_id = None
@@ -328,9 +382,17 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
         name_val, qty_val, expiry_val = result
 
         if editing_item_id is None:
-            # ADD MODE: no existing row is selected, so insert a brand new item
-            item = FoodItem(item_id=None, name=name_val, quantity=qty_val, expiry_date=expiry_val)
-            db.insert_item(conn, item)
+            duplicate = db.find_duplicate(conn, name_val, expiry_val)
+            if duplicate is not None:
+                new_qty = duplicate.quantity + qty_val
+                db.update_quantity(conn, duplicate.item_id, new_qty)
+                messagebox.showinfo(
+                    "Quantity Updated",
+                    f"Quantity updated: {duplicate.name} now has {new_qty} in stock"
+                )
+            else:
+                item = FoodItem(item_id=None, name=name_val, quantity=qty_val, expiry_date=expiry_val)
+                db.insert_item(conn, item)
         else:
             # EDIT MODE: overwrite the row that was loaded by _start_edit
             db.update_item(conn, editing_item_id, name_val, qty_val, expiry_val)
@@ -351,13 +413,11 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
         qty_entry.insert(0, str(qty_val))
         qty_entry.config(fg="black")
 
-        _dt = datetime.strptime(expiry_val, "%d/%m/%Y")
         expiry_entry.delete(0, tk.END)
         expiry_entry.insert(0, expiry_val)
-        _cal.selection_set(_dt)
 
-        editing_item_id[0] = int(row_id)
-        save_button.config(text="Save Changes")
+        editing_item_id = int(row_id)
+        save_button.config(text="SAVE CHANGES")
 
     def _on_tree_click(event):
         if tree.identify_region(event.x, event.y) != "cell":
@@ -397,6 +457,17 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
         checked_items.clear()
         refresh_listbox()
 
+    def _show_cached_recipes():
+        cached = db.fetch_saved_recipes(conn)
+        if not cached:
+            update_recipes(
+                [],
+                note="No cached recipes available. Connect to the internet to fetch recipes."
+            )
+        else:
+            update_recipes(cached, note="Showing cached recipes — you are offline")
+        notebook.select(1)
+
     def _on_get_recipes():
         all_items = db.fetch_all_items(conn)
         if checked_items:
@@ -409,8 +480,12 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
             messagebox.showinfo("No Items", "Add some food items first.")
             return
 
-        try:
-            recipes = api.get_recipes(items_to_use)
+        recipes_button.config(state="disabled", text="Loading…")
+
+        def _reset_button():
+            recipes_button.config(state="normal", text="GET RECIPES")
+
+        def _finish_online(recipes):
             if checked_items:
                 for r in recipes:
                     r.is_manual_selection = True
@@ -418,16 +493,32 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
             recipes.sort(key=lambda r: r.match_count, reverse=True)
             for r in recipes:
                 db.insert_recipe(conn, r)
-            update_recipes(recipes)
+            display_recipes = [db.fetch_recipe_by_title(conn, r.title) for r in recipes]
+            update_recipes(display_recipes)
             notebook.select(1)
+            _reset_button()
 
-        except api.OfflineError:
-            cached = db.fetch_saved_recipes(conn)
-            update_recipes(cached, note="Showing cached recipes")
-            notebook.select(1)
+        def _finish_offline():
+            _show_cached_recipes()
+            _reset_button()
 
-        except api.APIError as exc:
+        def _finish_error(exc):
             messagebox.showerror("API Error", str(exc))
+            _reset_button()
+
+        def _worker():
+            if not api.is_online():
+                tab.after(0, _finish_offline)
+                return
+            try:
+                recipes = api.get_recipes(items_to_use)
+                tab.after(0, _finish_online, recipes)
+            except api.OfflineError:
+                tab.after(0, _finish_offline)
+            except api.APIError as exc:
+                tab.after(0, _finish_error, exc)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ADD ITEM / SAVE CHANGES button
     save_button = tk.Button(
@@ -436,12 +527,13 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
         padx=10, pady=4,
         command=_on_save,
     )
-    save_button.grid(row=4, column=1, sticky="e", pady=(8, 0))
+    save_button.grid(row=3, column=1, sticky="e", pady=(8, 0))
 
     remove_button.config(command=_on_remove_selected)
     recipes_button.config(command=_on_get_recipes)
 
     tree.bind("<Button-1>", _on_tree_click)
+    search_entry.bind("<KeyRelease>", lambda _event: _apply_search())
 
     for _sort_label, _key in (
         ("Name",        "name"),
@@ -506,42 +598,211 @@ def _build_details_tab(notebook: ttk.Notebook):
     return tab, update_details
 
 
-def _build_recipes_tab(notebook: ttk.Notebook, update_details=None, details_tab=None):
+def _build_recipes_tab(notebook: ttk.Notebook, conn, update_details=None, details_tab=None):
     tab = ttk.Frame(notebook, padding=8)
+    inner_nb = ttk.Notebook(tab)
+    inner_nb.pack(fill="both", expand=True)
 
-    tk.Label(tab, text="Recipe Suggestions",
-             font=("TkDefaultFont", 14, "bold")).pack(anchor="w", pady=(0, 6))
+    DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+    #  SUB-TAB 2: FAVOURITES
+    fav_tab = ttk.Frame(inner_nb, padding=8)
+
+    tk.Label(fav_tab, text="Saved Favourites",
+             font=("TkDefaultFont", 13, "bold")).pack(anchor="w", pady=(0, 6))
+
+    fav_list_frame = tk.Frame(fav_tab)
+    fav_list_frame.pack(fill="x")
+
+    fav_listbox = tk.Listbox(fav_list_frame, height=8, selectmode="single",
+                             exportselection=False)
+    fav_scroll = ttk.Scrollbar(fav_list_frame, orient="vertical",
+                               command=fav_listbox.yview)
+    fav_listbox.configure(yscrollcommand=fav_scroll.set)
+    fav_listbox.pack(side="left", fill="x", expand=True)
+    fav_scroll.pack(side="right", fill="y")
+
+    tk.Label(fav_tab, text="Ingredients:",
+             font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(8, 2))
+
+    ing_frame = tk.Frame(fav_tab)
+    ing_frame.pack(fill="both", expand=True)
+
+    ing_text = tk.Text(ing_frame, height=6, state="disabled", wrap="word",
+                       relief="solid", bd=1, font=("TkDefaultFont", 10))
+    ing_scroll = ttk.Scrollbar(ing_frame, orient="vertical", command=ing_text.yview)
+    ing_text.configure(yscrollcommand=ing_scroll.set)
+    ing_text.pack(side="left", fill="both", expand=True)
+    ing_scroll.pack(side="right", fill="y")
+
+    fav_btn_frame = tk.Frame(fav_tab)
+    fav_btn_frame.pack(fill="x", pady=(8, 0))
+    _fav_data = []
+
+    def refresh_favs():
+        nonlocal _fav_data
+        _fav_data = db.fetch_favourites(conn)
+        fav_listbox.delete(0, tk.END)
+        for r in _fav_data:
+            fav_listbox.insert(tk.END, r.title)
+        ing_text.config(state="normal")
+        ing_text.delete("1.0", tk.END)
+        ing_text.config(state="disabled")
+
+    def _on_fav_select(_event=None):
+        sel = fav_listbox.curselection()
+        if not sel:
+            return
+        recipe = _fav_data[sel[0]]
+        # The favourites table only stores title + ingredients; instructions
+        # are pulled from the recipes cache (keyed by title) so favourites
+        # show full details offline too.
+        cached = db.fetch_recipe_by_title(conn, recipe.title)
+        ing_text.config(state="normal")
+        ing_text.delete("1.0", tk.END)
+        for ing in (recipe.ingredients or []):
+            ing_text.insert(tk.END, f"• {ing}\n")
+        ing_text.insert(tk.END, "\nINSTRUCTIONS\n")
+        ing_text.insert(tk.END, (cached.instructions if cached else "No instructions available.") + "\n")
+        ing_text.config(state="disabled")
+
+    fav_listbox.bind("<<ListboxSelect>>", _on_fav_select)
+
+    #  SUB-TAB 3: MEAL PLANNER 
+    meal_tab = ttk.Frame(inner_nb, padding=8)
+
+    tk.Label(meal_tab, text="Weekly Meal Plan",
+             font=("TkDefaultFont", 13, "bold")).pack(anchor="w", pady=(0, 8))
+
+    grid_frame = tk.Frame(meal_tab)
+    grid_frame.pack(fill="x")
+    day_title_vars = {}
+
+    for col, day in enumerate(DAYS):
+        slot = tk.LabelFrame(grid_frame, text=day[:3], padx=4, pady=4)
+        slot.grid(row=0, column=col, padx=2, pady=4, sticky="n")
+
+        var = tk.StringVar(value="—")
+        day_title_vars[day] = var
+
+        day_label = tk.Label(slot, textvariable=var, wraplength=68, justify="center",
+                             width=8, font=("TkDefaultFont", 9), cursor="hand2")
+        day_label.pack()
+
+        def _make_day_click(d=day):
+            def _on_day_click(_event=None):
+                title = day_title_vars[d].get()
+                if title == "—" or update_details is None or details_tab is None:
+                    return
+                cached = db.fetch_recipe_by_title(conn, title)
+                if cached is None:
+                    update_details(title, error="No cached details available for this recipe.")
+                else:
+                    steps = [
+                        (i + 1, step)
+                        for i, step in enumerate(cached.instructions.split("\n"))
+                        if step.strip()
+                    ]
+                    update_details(cached.title, ingredients=cached.ingredients, steps=steps)
+                notebook.select(details_tab)
+            return _on_day_click
+
+        day_label.bind("<Button-1>", _make_day_click())
+
+        def _make_clear(d=day):
+            def _do_clear():
+                db.clear_meal(conn, d)
+                day_title_vars[d].set("—")
+            return _do_clear
+
+        tk.Button(slot, text="Clear", command=_make_clear(), pady=1,
+                  font=("TkDefaultFont", 8)).pack(pady=(4, 0))
+
+    def refresh_meal():
+        plan = db.fetch_meal_plan(conn)
+        for d in DAYS:
+            day_title_vars[d].set(plan.get(d, "—"))
+    refresh_meal()
+
+    # ADD YOUR OWN MEAL BOX
+    # lets the user type any meal (not just a saved recipe) and put it on a day;
+    # meal_plan already stores day + title as plain text, so no DB change needed
+    own_meal_section = tk.LabelFrame(meal_tab, text=" ADD YOUR OWN MEAL ", padx=8, pady=8)
+    own_meal_section.pack(fill="x", pady=(8, 0))
+
+    tk.Label(own_meal_section, text="Meal:").grid(
+        row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+
+    own_meal_entry = tk.Entry(own_meal_section, width=28)
+    own_meal_entry.grid(row=0, column=1, sticky="w", pady=3)
+    _attach_placeholder(own_meal_entry, "e.g. Leftover pasta")
+
+    tk.Label(own_meal_section, text="Day:").grid(
+        row=1, column=0, sticky="w", padx=(0, 8), pady=3)
+
+    # readonly so only one of the seven days can be picked
+    own_day_var = tk.StringVar(value=DAYS[0])
+    ttk.Combobox(own_meal_section, textvariable=own_day_var, values=DAYS,
+                 state="readonly", width=14).grid(row=1, column=1, sticky="w", pady=3)
+
+    def _on_add_own_meal():
+        # placeholder text counts as empty
+        raw_name = own_meal_entry.get()
+        meal_name = "" if raw_name == "e.g. Leftover pasta" else raw_name.strip()
+        if not meal_name:
+            messagebox.showerror("Input Error", "Meal name cannot be blank.")
+            return
+        if len(meal_name) > 40:
+            messagebox.showerror("Input Error", "Meal name must be 40 characters or fewer.")
+            return
+        # replaces any meal already on that day, same as Favourites "Add to Meal Plan"
+        db.insert_meal(conn, own_day_var.get(), meal_name)
+        refresh_meal()
+        _restore_placeholder(own_meal_entry, "e.g. Leftover pasta")
+        # move focus off the entry so the next click clears the placeholder
+        own_meal_section.focus_set()
+
+    tk.Button(own_meal_section, text="+ ADD MEAL", command=_on_add_own_meal,
+              padx=10, pady=4).grid(row=2, column=1, sticky="e", pady=(8, 0))
+
+    # SUB-TAB 1: SUGGESTIONS
+    sug_tab = ttk.Frame(inner_nb, padding=8)
+
+    tk.Label(sug_tab, text="Recipe Suggestions",
+             font=("TkDefaultFont", 13, "bold")).pack(anchor="w", pady=(0, 4))
 
     note_label = tk.Label(
-        tab, text="",
+        sug_tab, text="",
         bg="#fff3cd", fg="#856404",
         anchor="w", padx=8, pady=4,
         relief="solid", bd=1,
     )
 
     current_recipes = [[]]
-    selected_idx    = [None] 
-
-    recipe_widgets = []
+    selected_idx    = [None]
+    card_widgets = []
 
     for i in range(3):
-        lframe = tk.LabelFrame(tab, text=f" Recipe {i + 1} ", padx=8, pady=8)
+        lframe = tk.LabelFrame(sug_tab, text=f" Recipe {i + 1} ", padx=8, pady=6)
         lframe.pack(fill="x", pady=4)
 
-        title_lbl = tk.Label(lframe, text="Recipe title will appear here",
-                             font=("TkDefaultFont", 11, "bold"))
+        title_lbl = tk.Label(lframe, text="—",
+                             font=("TkDefaultFont", 11, "bold"), anchor="w")
         title_lbl.pack(anchor="w")
+        match_lbl = tk.Label(lframe, text="", wraplength=480, justify="left",
+                             anchor="w", font=("TkDefaultFont", 9), fg="grey")
+        match_lbl.pack(anchor="w", pady=(2, 4))
 
-        detail_lbl = tk.Label(lframe,
-                              text="Ingredients and details will be listed here.",
-                              wraplength=480, justify="left")
-        detail_lbl.pack(anchor="w", pady=(2, 0))
+        save_var = tk.StringVar(value="♡ Save to Favourites")
+        save_btn = tk.Button(lframe, textvariable=save_var, padx=6, pady=2,
+                             state="disabled")
+        save_btn.pack(anchor="e")
 
-        recipe_widgets.append((lframe, title_lbl, detail_lbl))
+        card_widgets.append((lframe, title_lbl, match_lbl, save_btn, save_var))
 
     def _select_slot(idx):
         selected_idx[0] = idx
-        for j, (lf, _, _) in enumerate(recipe_widgets):
+        for j, (lf, *_) in enumerate(card_widgets):
             lf.config(relief="solid" if j == idx else "groove")
 
         if update_details is None or details_tab is None:
@@ -551,77 +812,114 @@ def _build_recipes_tab(notebook: ttk.Notebook, update_details=None, details_tab=
             return
         r = recipes[idx]
 
-        if r.id is None:
-            update_details(
-                r.title,
-                error="Full details not available for cached recipes (no Spoonacular ID).",
-            )
-            notebook.select(details_tab)
-            return
-
-        try:
-            details = api.get_recipe_details(r.id)
-            update_details(
-                details["title"],
-                ingredients=details["ingredients"],
-                steps=details["steps"],
-            )
-        except (api.OfflineError, api.APIError):
-            update_details(
-                r.title,
-                error="Could not load full recipe (offline or API error).",
-            )
+        steps = [
+            (i + 1, step)
+            for i, step in enumerate(r.instructions.split("\n"))
+            if step.strip()
+        ]
+        update_details(r.title, ingredients=r.ingredients, steps=steps)
         notebook.select(details_tab)
 
-    for i, (lf, title_lbl, detail_lbl) in enumerate(recipe_widgets):
-        for widget in (lf, title_lbl, detail_lbl):
-            widget.bind("<Button-1>", lambda _, idx=i: _select_slot(idx))
+    def _make_save_cb(idx):
+        def _save():
+            recipes = current_recipes[0]
+            if idx >= len(recipes):
+                return
+            recipe = recipes[idx]
+            if db.find_favourite(conn, recipe.title):
+                messagebox.showinfo("Already Saved", "Already in favourites")
+                return
+            db.insert_favourite(conn, recipe)
+            _, _, _, btn, var = card_widgets[idx]
+            var.set("✓ Saved")
+            btn.config(state="disabled")
+            messagebox.showinfo("Saved", "Recipe saved to favourites")
+            refresh_favs()
+        return _save
 
-    def _on_show_instructions():
-        idx = selected_idx[0]
-        if idx is None:
-            messagebox.showinfo("No Selection", "Click a recipe box to select it first.")
-            return
-        recipes = current_recipes[0]
-        if not recipes or idx >= len(recipes):
-            messagebox.showinfo("No Recipe", "No recipe loaded in that slot.")
-            return
-        r = recipes[idx]
-        body = (
-            "\n".join(f"• {ing}" for ing in r.ingredients)
-            if r.ingredients else "No ingredients available."
-        )
-        messagebox.showinfo(r.title, body)
-
-    # SELECT TO SEE INSTRUCTIONS button
-    tk.Button(
-        tab, text="SELECT TO SEE INSTRUCTIONS",
-        bg="#1565C0", fg="black", activebackground="#0d47a1",
-        padx=12, pady=6,
-        command=_on_show_instructions,
-    ).pack(anchor="w", pady=(12, 0))
+    for i, (lf, title_lbl, match_lbl, save_btn, save_var) in enumerate(card_widgets):
+        save_btn.config(command=_make_save_cb(i))
+        for w in (lf, title_lbl, match_lbl):
+            w.bind("<Button-1>", lambda _, idx=i: _select_slot(idx))
 
     def update_recipes(recipes: list, note: str = None):
+        inner_nb.select(sug_tab)
         current_recipes[0] = recipes
         selected_idx[0] = None
         if note:
             note_label.config(text=f"ℹ  {note}")
-            note_label.pack(fill="x", pady=(0, 6), before=recipe_widgets[0][0])
+            note_label.pack(fill="x", pady=(0, 6), before=card_widgets[0][0])
         else:
             note_label.pack_forget()
 
-        for i, (lf, title_lbl, detail_lbl) in enumerate(recipe_widgets):
+        for i, (lf, title_lbl, match_lbl, save_btn, save_var) in enumerate(card_widgets):
             lf.config(relief="groove")
             if i < len(recipes):
                 r = recipes[i]
                 title_lbl.config(text=r.title)
-                detail_lbl.config(
-                    text=f"{r.match_count} ingredient(s) matched"
-                         + (" (cached)" if r.is_cached else "")
-                )
+                match_lbl.config(text=_match_count_text(r.match_count))
+                save_var.set("♡ Save to Favourites")
+                save_btn.config(state="normal")
             else:
                 title_lbl.config(text="—")
-                detail_lbl.config(text="")
+                match_lbl.config(text="")
+                save_btn.config(state="disabled")
+
+    def _on_add_to_meal():
+        sel = fav_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("No Selection", "Click a recipe in the list first.")
+            return
+        recipe = _fav_data[sel[0]]
+
+        popup = tk.Toplevel(fav_tab)
+        popup.title("Add to Meal Plan")
+        popup.grab_set()
+        popup.resizable(False, False)
+
+        tk.Label(popup, text=f"Add  '{recipe.title}'  to which day?",
+                 padx=12, pady=8).pack()
+
+        day_var = tk.StringVar(value=DAYS[0])
+        combo = ttk.Combobox(popup, textvariable=day_var, values=DAYS,
+                             state="readonly", width=14)
+        combo.pack(padx=12, pady=(0, 8))
+
+        def _confirm():
+            db.insert_meal(conn, day_var.get(), recipe.title)
+            refresh_meal()
+            popup.destroy()
+            messagebox.showinfo("Meal Plan",
+                                f"'{recipe.title}' added to {day_var.get()}")
+
+        tk.Button(popup, text="Add", command=_confirm,
+                  padx=8, pady=4).pack(pady=(0, 10))
+
+        bx = fav_btn_frame.winfo_rootx()
+        by = fav_btn_frame.winfo_rooty()
+        popup.geometry(f"+{bx}+{by}")
+
+    def _on_remove_fav():
+        sel = fav_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("No Selection", "Click a recipe to select it first.")
+            return
+        recipe = _fav_data[sel[0]]
+        db.delete_favourite(conn, recipe.id)
+        refresh_favs()
+
+    tk.Button(fav_btn_frame, text="Add to Meal Plan",
+              command=_on_add_to_meal, padx=8, pady=4).pack(side="left", padx=(0, 8))
+    tk.Button(fav_btn_frame, text="Remove from Favourites",
+              command=_on_remove_fav, padx=8, pady=4).pack(side="left")
+
+    # Load favourites from DB on startup so saved recipes persist across restarts.
+    refresh_favs()
+
+    # Add sub-tabs to inner notebook in the order the user sees them.
+    inner_nb.add(sug_tab,  text=" SUGGESTIONS ")
+    inner_nb.add(fav_tab,  text=" FAVOURITES ")
+    inner_nb.add(meal_tab, text=" MEAL PLANNER ")
 
     return tab, update_recipes
 
@@ -643,7 +941,7 @@ def main():
 
     details_frame, update_details = _build_details_tab(notebook)
     recipes_frame, update_recipes = _build_recipes_tab(
-        notebook, update_details=update_details, details_tab=details_frame
+        notebook, conn, update_details=update_details, details_tab=details_frame
     )
     _build_items_tab(notebook, conn, update_recipes)
     notebook.add(recipes_frame, text=" RECIPES ")
