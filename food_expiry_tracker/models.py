@@ -26,14 +26,19 @@ class FoodItem:
 
 class Recipe:
 
-    def __init__(self, title: str, ingredients: list[str], match_count: int = 0, is_cached: bool = False, id: int = None):
+    def __init__(self, title: str, ingredients: list[str], match_count: int = 0, is_cached: bool = False,
+                 id: int = None, recipe_id: int = None, instructions: str = None):
         self.id = id
+        # the Spoonacular recipe id — used as the cache key in the recipes table
+        self.recipe_id = recipe_id
         self.title = title
         self.ingredients = ingredients
         # number of food items chosen to load recipe
         self.match_count = match_count
-        # true when this recipe was loaded from a local cache 
+        # true when this recipe was loaded from a local cache
         self.is_cached = is_cached
+        # default so the UI never shows a blank instructions panel
+        self.instructions = instructions if instructions else "No instructions available."
 
     def match_score(self, items: list[FoodItem]):
         item_names = {item.name.lower() for item in items}
@@ -41,6 +46,3 @@ class Recipe:
             1 for ingredient in self.ingredients
             if any(name in ingredient.lower() for name in item_names)
         )
-
-    def is_manual_selection(self):
-        return self.match_count > 0
