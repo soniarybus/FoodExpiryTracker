@@ -15,7 +15,6 @@ GREEN_BG  = "#d4edda"   # > 7 days remaining
 
 
 def validate_date(date_str: str, name: str):
-    #first we check wether the name isn't blank
     if not name.strip():
         messagebox.showerror("Input Error", "Food name cannot be blank")
         return False
@@ -24,7 +23,6 @@ def validate_date(date_str: str, name: str):
     except ValueError:
         messagebox.showerror("Input Error", "Date must be in DD/MM/YYYY format (e.g. 28/05/2026).")
         return False
-
     return True
 
 
@@ -335,19 +333,16 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
         refresh_listbox()
 
     def _validate_inputs():
-        # read raw text from every entry field
         raw_name   = name_entry.get()
         raw_qty    = qty_entry.get()
         raw_expiry = expiry_entry.get()
 
-        # treat placeholder text as "nothing entered" before validating
         name_val   = "" if raw_name   == "e.g. Apple" else raw_name.strip()
         expiry_val = raw_expiry.strip()
 
         if not validate_date(expiry_val, name_val):
             return None
 
-        # show an error if it isn't a plain integer
         qty_raw = raw_qty if raw_qty != "e.g. 3" else ""
         try:
             qty_val = int(qty_raw)
@@ -357,6 +352,7 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
         if qty_val <= 0:
             messagebox.showerror("Input Error", "Quantity must be a positive whole number.")
             return None
+        expiry_val = datetime.strptime(expiry_val, "%d/%m/%Y").strftime("%d/%m/%Y")
         return name_val, qty_val, expiry_val
 
     def _reset_form():
@@ -454,8 +450,17 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
         checked_items.clear()
         refresh_listbox()
 
-    def _show_cached_recipes():
+    def _show_cached_recipes(items=None):
         cached = db.fetch_saved_recipes(conn)
+        if items:
+            item_names = [it.name.lower() for it in items]
+            for r in cached:
+                r.match_count = sum(
+                    1 for name in item_names
+                    if any(name in ing.lower() for ing in r.ingredients)
+                )
+            cached = [r for r in cached if r.match_count > 0]
+            cached.sort(key=lambda r: r.match_count, reverse=True)
         if not cached:
             update_recipes(
                 [],
@@ -492,7 +497,7 @@ def _build_items_tab(notebook: ttk.Notebook, conn, update_recipes):
             _reset_button()
 
         def _finish_offline():
-            _show_cached_recipes()
+            _show_cached_recipes(items_to_use)
             _reset_button()
 
         def _finish_error(exc):

@@ -97,20 +97,20 @@ def get_recipes(items: list):
     if not entries:
         return []
     with ThreadPoolExecutor(max_workers=len(entries)) as executor:
-        instructions_list = list(
+        details_list = list(
             executor.map(lambda e: _fetch_instructions(e["recipe_id"]), entries)
         )
 
     return [
         Recipe(
             title=e["title"],
-            ingredients=e["ingredients"],
+            ingredients=full_ingredients or e["ingredients"],
             match_count=e["match_count"],
             is_cached=False,
             recipe_id=e["recipe_id"],
             instructions=instructions,
         )
-        for e, instructions in zip(entries, instructions_list)
+        for e, (instructions, full_ingredients) in zip(entries, details_list)
     ]
 
 
@@ -122,14 +122,16 @@ def _fetch_instructions(recipe_id):
             timeout=10,
         )
         if info_response.status_code != 200:
-            return None
+            return None, []
         info_data = info_response.json()
+        ingredients = [clean_ingredient(ing.get("original")) for ing in info_data.get("extendedIngredients", [])]
+        ingredients = [i for i in ingredients if i]
         analyzed = info_data.get("analyzedInstructions", [])
         if analyzed and analyzed[0].get("steps"):
             steps = [step["step"] for step in analyzed[0]["steps"]]
             if steps:
-                return "\n".join(steps)
+                return "\n".join(steps), ingredients
         plain = _HTML_TAG_RE.sub("", info_data.get("instructions") or "").strip()
-        return plain or None
+        return plain or None, ingredients
     except Exception:
-        return None
+        return None, []

@@ -20,7 +20,6 @@ class FoodItem:
         return "green"
 
     def expiry_date_str(self):
-    #This is needed to display it back into GUI as a str   
         return self.expiry_date.strftime("%d/%m/%Y")
 
 
@@ -39,10 +38,3 @@ class Recipe:
         self.is_cached = is_cached
         # default so the UI never shows a blank instructions panel
         self.instructions = instructions if instructions else "No instructions available."
-
-    def match_score(self, items: list[FoodItem]):
-        item_names = {item.name.lower() for item in items}
-        return sum(
-            1 for ingredient in self.ingredients
-            if any(name in ingredient.lower() for name in item_names)
-        )

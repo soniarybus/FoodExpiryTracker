@@ -71,7 +71,7 @@ def _migrate_clean_ingredients(conn):
     rows = cursor.fetchall()
     for row_id, raw in rows:
         cleaned_list = [clean_ingredient(i) for i in _parse_ingredients(raw)]
-        cleaned_str = ", ".join(i for i in cleaned_list if i)
+        cleaned_str = json.dumps([i for i in cleaned_list if i], ensure_ascii=False)
         if cleaned_str != (raw or ""): #only if there was a cleanup needed 
             cursor.execute( 
                 "UPDATE recipes SET ingredients = ? WHERE id = ?",
@@ -84,7 +84,7 @@ def insert_item(conn, item):
 
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO food_items (name, quantity, expiry_date) VALUES (?, ?, ?)",  # prevents SQL injection
+        "INSERT INTO food_items (name, quantity, expiry_date) VALUES (?, ?, ?)",
         (item.name, item.quantity, item.expiry_date_str())
     )
     conn.commit()
@@ -151,7 +151,7 @@ def insert_recipe(conn, recipe):
     cursor = conn.cursor()
     cached_at = datetime.today().strftime("%d/%m/%Y")
     cleaned = [clean_ingredient(i) for i in recipe.ingredients] if recipe.ingredients else []
-    ingredients_str = ", ".join(i for i in cleaned if i)
+    ingredients_str = json.dumps([i for i in cleaned if i], ensure_ascii=False)
     cursor.execute(
         """INSERT OR REPLACE INTO recipes
            (recipe_id, title, ingredients, instructions, match_count, cached_at)
@@ -206,7 +206,7 @@ def insert_favourite(conn, recipe):
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO favourites (title, ingredients) VALUES (?, ?)",
-        (recipe.title, ", ".join(recipe.ingredients) if recipe.ingredients else "")
+        (recipe.title, json.dumps(recipe.ingredients or [], ensure_ascii=False))
     )
     conn.commit()
     return cursor.lastrowid
